@@ -1,4 +1,27 @@
-# Baseline：原版 ZKBag 讀取效能
+# Baseline：原版 Dora 效能
+
+## ZKDisj 折疊層（Interstellar 改動要比較的對象）
+
+`dietmc_0p` 跑隨機產生的 disjunction 電路（產生器：`diet-mac-and-cheese/gen/disj-small-bench.py`，
+跟論文的 `disj-hyper-param.py` 相同，只是參數縮小）。每條指令 100 個輸入、100 個輸出（gate 數較少時取 gate 數）。
+欄位為 F61p，LPN `medium`，環境同下方。
+
+| 指令數 | 每條 gate 數 | 步數 | prover 時間 | 通訊量 (bytes total) |
+|---|---|---|---|---|
+| 8 | 64 | 2000 | 4.21 s | 19,666,928 |
+| 8 | 512 | 2000 | 4.65 s | 33,803,536 |
+
+重跑：
+
+```bash
+python3 diet-mac-and-cheese/gen/disj-small-bench.py f61 /tmp/dora-circ
+cargo build --release --bin dietmc_0p
+experiments/runcirc.sh /tmp/dora-circ/branches_0000000000128000_2000_clauses_8_gates_64 c8-g64
+```
+
+---
+
+## ZKBag 讀取（RAM）
 
 這是**未經修改**的 Dora 實作（上游 `rot256/research-dora`，commit `ddf48f9`）的基準數字，之後所有改動都拿來跟這份比。
 
