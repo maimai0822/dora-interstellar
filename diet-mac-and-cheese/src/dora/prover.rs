@@ -4,14 +4,18 @@ use scuttlebutt::{field::FiniteField, AbstractChannel};
 use swanky_field::IsSubFieldOf;
 
 use crate::{
-    dora::{comm::CommittedWitness, tx::TxChannel, COMPACT_MIN, COMPACT_MUL},
+    dora::{
+        comm::{CommittedEvals, CommittedWitness},
+        r1cs::lagrange_coeffs,
+        tx::TxChannel,
+        COMPACT_MIN, COMPACT_MUL,
+    },
     homcom::MacProver,
     DietMacAndCheeseProver,
 };
 
 use super::{
     acc::{self, collapse_trace, Accumulator, ComittedAcc, Trace},
-    comm::CommittedCrossTerms,
     disjunction::Disjunction,
     fiat_shamir,
     perm::permutation,
@@ -29,6 +33,9 @@ where
     init: Vec<ComittedAcc<DietMacAndCheeseProver<V, F, C>>>,
     trace: Vec<Trace<DietMacAndCheeseProver<V, F, C>>>,
     max_trace: usize, // maximum trace len before compactification
+    // test only: corrupt the witness of the given call (to test soundness)
+    #[cfg(test)]
+    pub(crate) cheat_at: Option<usize>,
 }
 
 impl<V: IsSubFieldOf<F>, F: FiniteField, C: AbstractChannel> DoraProver<V, F, C>
@@ -51,6 +58,8 @@ where
             init: vec![],
             calls: 0,
             disj,
+            #[cfg(test)]
+            cheat_at: None,
         }
     }
 
@@ -72,17 +81,21 @@ where
         let clause = self.disj.clause(opt);
 
         // compute extended witness for the clause
-        let wit = clause.compute_witness(input.iter().map(|inp| inp.value()));
+        #[allow(unused_mut)]
+        let mut wit = clause.compute_witness(input.iter().map(|inp| inp.value()));
         debug_assert!(wit.check(clause));
 
-        // compute cross terms with accumulator
-        debug_assert!(self.accs[opt].check(clause));
-        let cxt = clause.cross_wit_acc(&wit, &self.accs[opt]);
+        #[cfg(test)]
+        if self.cheat_at == Some(self.calls) {
+            // claim a wrong value for the last intermediate wire
+            let last = wit.wit.len() - 1;
+            wit.wit[last] += V::ONE;
+        }
 
         // wrap in transcript hasher (if FS enabled)
         let mut ch = TxChannel::new(prover.channel.clone(), &mut self.tx);
 
-        // commit to extended witness
+        // 1. commit to extended witness w2
         let comm_wit = CommittedWitness::commit_prover(
             &mut ch,
             prover,
@@ -92,21 +105,28 @@ where
         )?;
         debug_assert_eq!(comm_wit.value(clause), wit);
 
-        // commit to cross terms
-        let comm_cxt = CommittedCrossTerms::commit_prover(&mut ch, prover, &self.disj, &cxt)?;
-
-        // commit to old accumulator
+        // 2. commit to old accumulator (tau1, w1, y1)
         let comm_acc = ComittedAcc::commit_prover(&mut ch, prover, &self.disj, &self.accs[opt])?;
-        debug_assert!(self.accs[opt].check(clause));
         debug_assert_eq!(&comm_acc.value(clause), &self.accs[opt]);
 
-        // fold extended witness, accumulator and cross terms
-        let challenge = ch.challenge();
-        let comm_acc_new = comm_acc.fold_witness(prover, challenge, &comm_cxt, &comm_wit)?;
+        // 3. challenge tau2 for the fresh instance (after w2 is fixed)
+        let tau2: Vec<V> = (0..self.disj.log_rows()).map(|_| ch.challenge()).collect();
+
+        // 4. commit to y(2), ..., y(k + 2) along the line between the instances
+        let evals = clause.fold_evals(&self.accs[opt], &tau2, &wit);
+        let comm_evals = CommittedEvals::commit_prover(&mut ch, prover, &self.disj, &evals)?;
+
+        // 5. fold at a random point r
+        let r: V = ch.challenge();
+        let lag = lagrange_coeffs(self.disj.num_evals() + 2, r);
+        let comm_acc_new = comm_acc.fold(prover, r, &tau2, &comm_evals, &comm_wit, &lag)?;
 
         // store new accumulator
         self.accs[opt] = comm_acc_new.value(clause);
+        #[cfg(not(test))]
         debug_assert!(self.accs[opt].check(clause));
+        #[cfg(test)]
+        assert!(self.cheat_at.is_some() || self.accs[opt].check(clause));
 
         // add to trace (for permutation proof)
         self.trace.push(Trace {
@@ -175,7 +195,7 @@ where
             lhs.push(acc.combine(prover, chal_cmbn)?);
             rhs.push(match self.init.get(i) {
                 Some(acc) => acc.combine(prover, chal_cmbn)?,
-                None => Accumulator::init(r1cs).combine(prover, chal_cmbn)?,
+                None => Accumulator::init(r1cs).combine(prover, &self.disj, chal_cmbn)?,
             });
         }
 
@@ -288,5 +308,138 @@ mod tests {
         dmc.finalize().unwrap();
 
         handle.join().unwrap();
+    }
+
+    // clauses with multiplications: out = x * y + c_i * x, plus a few extra
+    // multiplication rows (so there are intermediate wires to cheat on)
+    fn mul_clauses(n: usize) -> Vec<Clause<F61p>> {
+        (0..n)
+            .map(|i| {
+                let c = F61p::try_from((i + 3) as u128).unwrap();
+                Clause {
+                    gates: vec![
+                        DisjGate::Mul(3, 1, 2),
+                        DisjGate::MulConstant(4, 1, c),
+                        DisjGate::Add(0, 3, 4),
+                        DisjGate::Mul(5, 3, 3),
+                        DisjGate::Mul(6, 5, 1),
+                        DisjGate::Mul(7, 6, 2),
+                    ],
+                }
+            })
+            .collect()
+    }
+
+    // folding on plain values: the invariant G(tau, w) = y is kept by honest folds,
+    // and a single bad witness makes the final accumulator invalid
+    #[test]
+    fn test_fold_plain() {
+        use super::super::r1cs::lagrange_coeffs;
+        let disj = Disjunction::new(mul_clauses(3).into_iter(), 2, 1);
+        let mut rng = AesRng::from_seed(Default::default());
+        for cheat in [None, Some(7)] {
+            let mut accs: Vec<_> = disj.clauses().iter().map(Accumulator::init).collect();
+            for step in 0..20 {
+                let opt = step % 3;
+                let clause = disj.clause(opt);
+                let x = F61p::random(&mut rng);
+                let y = F61p::random(&mut rng);
+                let mut wit = clause.compute_witness([x, y].into_iter());
+                if cheat == Some(step) {
+                    let last = wit.wit.len() - 1;
+                    wit.wit[last] += F61p::ONE;
+                }
+                let tau2: Vec<F61p> = (0..disj.log_rows()).map(|_| F61p::random(&mut rng)).collect();
+                let evals = clause.fold_evals(&accs[opt], &tau2, &wit);
+                let r = F61p::random(&mut rng);
+                let lag = lagrange_coeffs(disj.num_evals() + 2, r);
+                let acc = &accs[opt];
+                let omr = F61p::ONE - r;
+                let tau = acc.tau.iter().zip(tau2.iter()).map(|(a, b)| omr * *a + r * *b).collect();
+                let w = acc.wit.iter().zip(wit.wit.iter()).map(|(a, b)| omr * *a + r * *b).collect();
+                let mut ny = lag[0] * acc.y;
+                for (e, l) in evals.iter().zip(lag[2..].iter()) {
+                    ny += *e * *l;
+                }
+                accs[opt] = Accumulator { tau, wit: w, y: ny };
+                if cheat.map_or(true, |c| step < c) {
+                    assert!(accs[opt].check(clause), "honest fold broke the invariant");
+                }
+            }
+            let all_ok = accs.iter().zip(disj.clauses()).all(|(a, c)| a.check(c));
+            assert_eq!(all_ok, cheat.is_none());
+        }
+    }
+
+    // run the full prover/verifier protocol, returns the verifier's result
+    fn run_protocol(clauses: Vec<Clause<F61p>>, steps: usize, cheat_at: Option<usize>) -> Result<()> {
+        let nclauses = clauses.len();
+        let disj_p = Disjunction::new(clauses.iter().cloned(), 2, 1);
+        let disj_v = disj_p.clone();
+        let (sender, receiver) = UnixStream::pair().unwrap();
+
+        let handle = std::thread::spawn(move || -> Result<()> {
+            let rng = AesRng::from_seed(Default::default());
+            let reader = BufReader::new(sender.try_clone().unwrap());
+            let writer = BufWriter::new(sender);
+            let mut channel = Channel::new(reader, writer);
+            let mut prover: DietMacAndCheeseProver<F61p, F61p, _> = DietMacAndCheeseProver::init(
+                &mut channel,
+                rng,
+                LPN_SETUP_SMALL,
+                LPN_EXTEND_SMALL,
+                false,
+            )?;
+            let mut disj = DoraProver::<F61p, F61p, _>::new(disj_p);
+            disj.cheat_at = cheat_at;
+            for i in 0..steps {
+                let x = prover.input_private(Some(F61p::try_from((i + 1) as u128).unwrap()))?;
+                let y = prover.input_private(Some(F61p::try_from((7 * i + 2) as u128).unwrap()))?;
+                disj.mux(&mut prover, &[x, y], (3 * i + 1) % nclauses)?;
+            }
+            disj.finalize(&mut prover)?;
+            prover.finalize()?;
+            Ok(())
+        });
+
+        let rng = AesRng::from_seed(Default::default());
+        let reader = BufReader::new(receiver.try_clone().unwrap());
+        let writer = BufWriter::new(receiver);
+        let mut channel = Channel::new(reader, writer);
+        let res = (|| -> Result<()> {
+            let mut dmc: DietMacAndCheeseVerifier<F61p, F61p, _> =
+                DietMacAndCheeseVerifier::init(
+                    &mut channel,
+                    rng,
+                    LPN_SETUP_SMALL,
+                    LPN_EXTEND_SMALL,
+                    false,
+                )?;
+            let mut disj = DoraVerifier::new(disj_v);
+            for _ in 0..steps {
+                let x = dmc.input_private(None)?;
+                let y = dmc.input_private(None)?;
+                disj.mux(&mut dmc, &[x, y])?;
+            }
+            disj.finalize(&mut dmc)?;
+            dmc.finalize()?;
+            Ok(())
+        })();
+        drop(channel);
+        let _ = handle.join();
+        res
+    }
+
+    #[test]
+    fn test_mul_clauses_honest() {
+        run_protocol(mul_clauses(4), 200, None).expect("honest prover rejected");
+    }
+
+    #[test]
+    fn test_mul_clauses_cheat_detected() {
+        assert!(
+            { let r = run_protocol(mul_clauses(4), 200, Some(50)); println!("cheat result: {:?}", r.as_ref().err().map(|e| e.to_string())); r.is_err() },
+            "cheating prover accepted"
+        );
     }
 }

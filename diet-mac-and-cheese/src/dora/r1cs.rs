@@ -152,6 +152,9 @@ pub(super) struct R1CS<F: FiniteField> {
     pub output: usize,
     pub gates: Vec<DisjGate<F>>, // used for witness computation
     pub rows: Vec<Row<F>>,
+    // k = log2 of the (padded) number of rows, shared by every clause of the
+    // disjunction so that the folding transcript does not depend on the clause
+    pub log_rows: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -183,10 +186,6 @@ impl<F: FiniteField> ExtendedWitness<F> {
         }
         true
     }
-}
-
-pub(super) struct CrossTerms<F: FiniteField> {
-    pub(crate) terms: Vec<F>,
 }
 
 impl<F: FiniteField> R1CS<F> {
@@ -308,6 +307,7 @@ impl<F: FiniteField> R1CS<F> {
             cells: num_cells,
             gates: gates.to_vec(),
             rows: cs,
+            log_rows: 0, // set by Disjunction::new
         }
     }
 
@@ -386,40 +386,118 @@ impl<F: FiniteField> R1CS<F> {
         ext
     }
 
-    fn cross_terms(&self, wit1: &[F], wit2: &[F]) -> CrossTerms<F> {
-        debug_assert_eq!(wit1.len(), self.dim);
-        debug_assert_eq!(wit2.len(), self.dim);
 
-        // compute u1 * z1 - u2 * z2
-        // (to reduce number of matrix multiplications)
-        let u1 = wit1[CONSTANT_IDX];
-        let u2 = wit2[CONSTANT_IDX];
-        let mut u1z1_u2z2 = Vec::with_capacity(self.dim);
-        for (z1, z2) in wit1.iter().copied().zip(wit2.iter().copied()) {
-            u1z1_u2z2.push(u1 * z2 + u2 * z1);
+    pub(crate) fn log_rows(&self) -> usize {
+        self.log_rows
+    }
+
+    /// Number of evaluations of y(t) the prover commits to per fold:
+    /// y(t) has degree k + 2 (eq(tau(t), i) has degree k, each constraint degree 2),
+    /// so k + 3 points determine it. y(0) and y(1) are known, which leaves k + 1.
+    pub(crate) fn num_evals(&self) -> usize {
+        self.log_rows + 1
+    }
+
+    /// The constraint polynomial F_i(w) = l_i(w) * r_i(w) - o_i(w)
+    fn constraint(row: &Row<F>, w: &[F]) -> F {
+        let (l, r, o) = row.eval(w);
+        l * r - o
+    }
+
+    /// G(tau, w) = sum_i eq(tau, i) * F_i(w)
+    ///
+    /// The accumulator relation (Interstellar-style circuit interpolation)
+    /// is G(tau, w) = y.
+    pub(crate) fn eval_g(&self, tau: &[F], w: &[F]) -> F {
+        debug_assert_eq!(tau.len(), self.log_rows);
+        let eq = eq_table(tau);
+        debug_assert!(eq.len() >= self.rows());
+        let mut y = F::ZERO;
+        for (row, e) in self.rows.iter().zip(eq.iter().copied()) {
+            y += e * Self::constraint(row, w);
         }
-
-        // compute err cross terms
-        let mut terms = Vec::with_capacity(self.rows());
-        terms.extend(self.rows.iter().map(|row| {
-            let a_z1 = row.l.eval(wit1);
-            let a_z2 = row.l.eval(wit2);
-            let b_z1 = row.r.eval(wit1);
-            let b_z2 = row.r.eval(wit2);
-            let c_z1z2 = row.o.eval(&u1z1_u2z2);
-            a_z1 * b_z2 + a_z2 * b_z1 - c_z1z2
-        }));
-        CrossTerms { terms }
+        y
     }
 
-    pub(crate) fn cross_wit_acc(
+    /// Evaluations of y(t) = G(tau(t), w(t)) at t = 2, ..., k + 2, where
+    ///
+    ///   tau(t) = (1 - t) * tau1 + t * tau2
+    ///   w(t)   = (1 - t) * w1   + t * w2
+    ///
+    /// with (tau1, w1, y1) the accumulator and (tau2, w2, 0) the fresh instance.
+    /// Note that y(0) = y1 and (for an honest prover) y(1) = 0.
+    pub(crate) fn fold_evals(
         &self,
-        wit: &ExtendedWitness<F>,
         acc: &Accumulator<F>,
-    ) -> CrossTerms<F> {
-        debug_assert_eq!(wit.wit.len(), self.dim);
+        tau2: &[F],
+        wit: &ExtendedWitness<F>,
+    ) -> Vec<F> {
+        debug_assert_eq!(acc.tau.len(), self.log_rows);
+        debug_assert_eq!(tau2.len(), self.log_rows);
         debug_assert_eq!(acc.wit.len(), self.dim);
-        debug_assert_eq!(acc.err.len(), self.rows.len());
-        self.cross_terms(&wit.wit, &acc.wit)
+        debug_assert_eq!(wit.wit.len(), self.dim);
+
+        let mut evals = Vec::with_capacity(self.num_evals());
+        let mut tau_t = vec![F::ZERO; self.log_rows];
+        let mut w_t = vec![F::ZERO; self.dim];
+        for j in 0..self.num_evals() {
+            let t = small::<F>(j + 2);
+            let omt = F::ONE - t;
+            for (dst, (a, b)) in tau_t.iter_mut().zip(acc.tau.iter().zip(tau2.iter())) {
+                *dst = omt * *a + t * *b;
+            }
+            for (dst, (a, b)) in w_t.iter_mut().zip(acc.wit.iter().zip(wit.wit.iter())) {
+                *dst = omt * *a + t * *b;
+            }
+            evals.push(self.eval_g(&tau_t, &w_t));
+        }
+        evals
     }
+}
+
+/// The table eq(tau, i) for i = 0, ..., 2^k - 1,
+/// where bit j of i is matched against tau[j]:
+///
+///   eq(tau, i) = prod_j (i_j ? tau_j : 1 - tau_j)
+pub(super) fn eq_table<F: FiniteField>(tau: &[F]) -> Vec<F> {
+    let mut table = Vec::with_capacity(1 << tau.len());
+    table.push(F::ONE);
+    for t in tau.iter().copied() {
+        let len = table.len();
+        let omt = F::ONE - t;
+        for i in 0..len {
+            let e = table[i];
+            table.push(e * t);
+            table[i] = e * omt;
+        }
+    }
+    table
+}
+
+/// The field element n (for small n)
+pub(super) fn small<F: FiniteField>(n: usize) -> F {
+    let mut x = F::ZERO;
+    for _ in 0..n {
+        x += F::ONE;
+    }
+    x
+}
+
+/// Lagrange coefficients L_0(r), ..., L_{n-1}(r) for the points 0, 1, ..., n - 1,
+/// i.e. p(r) = sum_j L_j(r) * p(j) for every polynomial p of degree < n.
+pub(super) fn lagrange_coeffs<F: FiniteField>(n: usize, r: F) -> Vec<F> {
+    let pts: Vec<F> = (0..n).map(small::<F>).collect();
+    (0..n)
+        .map(|j| {
+            let mut num = F::ONE;
+            let mut den = F::ONE;
+            for m in 0..n {
+                if m != j {
+                    num *= r - pts[m];
+                    den *= pts[j] - pts[m];
+                }
+            }
+            num * den.inverse()
+        })
+        .collect()
 }

@@ -12,7 +12,7 @@ use crate::{
 use super::{
     acc::{Accumulator, ComittedAcc},
     disjunction::Disjunction,
-    r1cs::{CrossTerms, ExtendedWitness, R1CS},
+    r1cs::{ExtendedWitness, R1CS},
 };
 
 #[derive(Debug)]
@@ -169,51 +169,57 @@ where
     }
 }
 
-pub(super) struct CommittedCrossTerms<B: BackendT> {
-    pub terms: Vec<B::Wire>,
+/// Commitments to y(2), ..., y(k + 2) (see R1CS::fold_evals).
+///
+/// The number of evaluations is fixed by the disjunction (not the clause),
+/// and the values are committed rather than sent in the clear:
+/// both are needed to keep the active clause hidden.
+pub(super) struct CommittedEvals<B: BackendT> {
+    pub evals: Vec<B::Wire>,
 }
 
 impl<'a, V: IsSubFieldOf<F>, F: FiniteField, C: AbstractChannel>
-    CommittedCrossTerms<DietMacAndCheeseProver<V, F, C>>
+    CommittedEvals<DietMacAndCheeseProver<V, F, C>>
 where
     F::PrimeField: IsSubFieldOf<V>,
 {
-    pub fn commit_prover<'b>(
+    pub fn commit_prover(
         channel: &mut impl AbstractChannel,
         backend: &mut DietMacAndCheeseProver<V, F, C>,
         disj: &'a Disjunction<V>,
-        cxt: &CrossTerms<V>,
+        evals: &[V],
     ) -> Result<Self> {
-        let mut terms = Vec::with_capacity(disj.dim_err());
-        terms.extend(prover_commit_vec(
+        debug_assert_eq!(evals.len(), disj.num_evals());
+        let evals = prover_commit_vec(
             &mut backend.prover,
             channel,
             &mut backend.rng,
-            cxt.terms.iter().copied(),
-            disj.dim_err(),
-        )?);
-        Ok(Self { terms })
+            evals.iter().copied(),
+            disj.num_evals(),
+        )?
+        .collect();
+        Ok(Self { evals })
     }
 }
 
 impl<'a, V: IsSubFieldOf<F>, F: FiniteField, C: AbstractChannel>
-    CommittedCrossTerms<DietMacAndCheeseVerifier<V, F, C>>
+    CommittedEvals<DietMacAndCheeseVerifier<V, F, C>>
 where
     F::PrimeField: IsSubFieldOf<V>,
 {
-    pub fn commit_verifier<'b>(
+    pub fn commit_verifier(
         channel: &mut impl AbstractChannel,
         backend: &mut DietMacAndCheeseVerifier<V, F, C>,
         disj: &'a Disjunction<V>,
     ) -> Result<Self> {
-        let mut terms = Vec::with_capacity(disj.dim_err());
-        terms.extend(verifier_commit_vec(
+        let evals = verifier_commit_vec(
             &mut backend.verifier,
             channel,
             &mut backend.rng,
-            disj.dim_err(),
-        )?);
-        Ok(Self { terms })
+            disj.num_evals(),
+        )?
+        .collect();
+        Ok(Self { evals })
     }
 }
 
@@ -222,31 +228,26 @@ impl<V: IsSubFieldOf<F>, F: FiniteField, C: AbstractChannel>
 where
     F::PrimeField: IsSubFieldOf<V>,
 {
+    /// Commit to (tau || wit || y) in a single vector, padded to the disjunction size
     pub fn commit_prover<'a>(
         channel: &mut impl AbstractChannel,
         backend: &mut DietMacAndCheeseProver<V, F, C>,
         disj: &'a Disjunction<V>,
         acc: &Accumulator<V>,
     ) -> Result<Self> {
-        let wit = prover_commit_vec(
-            &mut backend.prover,
-            channel,
-            &mut backend.rng,
-            acc.wit.iter().copied(),
-            disj.dim_ext(),
-        )?
-        .collect();
-
-        let err = prover_commit_vec(
-            &mut backend.prover,
-            channel,
-            &mut backend.rng,
-            acc.err.iter().copied(),
-            disj.dim_err(),
-        )?
-        .collect();
-
-        Ok(Self { wit, err })
+        let k = disj.log_rows();
+        let n = disj.dim_ext();
+        debug_assert_eq!(acc.tau.len(), k);
+        let vals = acc
+            .tau
+            .iter()
+            .copied()
+            .chain(acc.wit.iter().copied().chain(std::iter::repeat(V::ZERO)).take(n))
+            .chain(iter::once(acc.y));
+        let all: Vec<_> =
+            prover_commit_vec(&mut backend.prover, channel, &mut backend.rng, vals, k + n + 1)?
+                .collect();
+        Ok(Self::split(all, k, n))
     }
 }
 
@@ -260,22 +261,20 @@ where
         backend: &mut DietMacAndCheeseVerifier<V, F, C>,
         disj: &'a Disjunction<V>,
     ) -> Result<Self> {
-        let wit = verifier_commit_vec(
-            &mut backend.verifier,
-            channel,
-            &mut backend.rng,
-            disj.dim_ext(),
-        )?
-        .collect();
+        let k = disj.log_rows();
+        let n = disj.dim_ext();
+        let all: Vec<_> =
+            verifier_commit_vec(&mut backend.verifier, channel, &mut backend.rng, k + n + 1)?
+                .collect();
+        Ok(Self::split(all, k, n))
+    }
+}
 
-        let err = verifier_commit_vec(
-            &mut backend.verifier,
-            channel,
-            &mut backend.rng,
-            disj.dim_err(),
-        )?
-        .collect();
-
-        Ok(Self { wit, err })
+impl<B: BackendT> ComittedAcc<B> {
+    fn split(mut all: Vec<B::Wire>, k: usize, n: usize) -> Self {
+        debug_assert_eq!(all.len(), k + n + 1);
+        let y = all.pop().unwrap();
+        let wit = all.split_off(k);
+        Self { tau: all, wit, y }
     }
 }

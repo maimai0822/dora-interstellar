@@ -3,7 +3,7 @@ use scuttlebutt::{field::FiniteField, AbstractChannel};
 use swanky_field::IsSubFieldOf;
 
 use crate::{
-    dora::{comm::CommittedCrossTerms, tx::TxChannel},
+    dora::{comm::CommittedEvals, r1cs::lagrange_coeffs, tx::TxChannel},
     homcom::MacVerifier,
     DietMacAndCheeseVerifier,
 };
@@ -58,19 +58,23 @@ where
         // wrap channel in transcript
         let mut ch = TxChannel::new(verifier.channel.clone(), &mut self.tx);
 
-        // commit to new extended witness
+        // 1. commit to new extended witness w2
         let wit =
             CommittedWitness::commit_verifer(&mut ch, verifier, &self.disj, input.iter().copied())?;
 
-        // commit to cross terms
-        let cxt = CommittedCrossTerms::commit_verifier(&mut ch, verifier, &self.disj)?;
-
-        // commit to old accumulator
+        // 2. commit to old accumulator
         let acc_old = ComittedAcc::commit_verifier(&mut ch, verifier, &self.disj)?;
 
-        // fold
-        let challenge = ch.challenge();
-        let acc_new = acc_old.fold_witness(verifier, challenge, &cxt, &wit)?;
+        // 3. challenge tau2
+        let tau2: Vec<V> = (0..self.disj.log_rows()).map(|_| ch.challenge()).collect();
+
+        // 4. commit to y(2), ..., y(k + 2)
+        let evals = CommittedEvals::commit_verifier(&mut ch, verifier, &self.disj)?;
+
+        // 5. fold at a random point r
+        let r: V = ch.challenge();
+        let lag = lagrange_coeffs(self.disj.num_evals() + 2, r);
+        let acc_new = acc_old.fold(verifier, r, &tau2, &evals, &wit, &lag)?;
 
         // update trace
         self.trace.push(Trace {
@@ -126,7 +130,7 @@ where
             lhs.push(acc.combine(verifier, chal_cmbn)?);
             rhs.push(match self.init.get(i) {
                 Some(acc) => acc.combine(verifier, chal_cmbn)?,
-                None => Accumulator::init(r1cs).combine(verifier, chal_cmbn)?,
+                None => Accumulator::init(r1cs).combine(verifier, &self.disj, chal_cmbn)?,
             });
         }
 
