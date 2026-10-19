@@ -727,6 +727,7 @@ dependencies = [
  "ocelot",
  "pretty_env_logger",
  "rand",
+ "rustc-hash",
  "scuttlebutt",
  "subtle",
  "swanky-field",
