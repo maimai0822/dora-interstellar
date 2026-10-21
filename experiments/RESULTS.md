@@ -76,6 +76,61 @@ benchmark 電路的實際維度（暫時加 log 印出）：
 
 64 gate Interstellar 的步數掃描（2000 / 6000 / 16000 步）：4.17 s / 5.95 s / 6.28 s。
 
+## 每步邊際成本（Intel Mac）
+
+環境：MacBook，Intel Core i5-1038NG7（4 核 8 緒）、16 GB、macOS 14.8.9（Darwin 23.6）、Rust 1.71.1（repo 指定），
+prover 與 verifier 同機 localhost。
+原版是 `minor-revision`（`ddf48f9`，與 BASELINE 同一 commit），用 git worktree 另外編譯。
+
+參數：電路由 `disj-hyper-param.py` 改參數產生（clauses = [8]、gates = [64, 512, 4096]、branches = [2000, 16000]），
+F61p、LPN `medium`、每條指令 100 輸入 / 100 輸出。
+每組跑 3 次，兩版交替執行（`experiments/runcirc.sh`，外包 `caffeinate -i`），prover 以 `/usr/bin/time -l` 量最大記憶體。
+時間取 time circ exec 的中位數；bytes total 三次都相同。
+
+邊際成本 = (t16000 − t2000) / 14000，bytes 同理。
+
+| 每條 gate 數 | 版本 | 2000 步時間（3 次） | 16000 步時間（3 次） | 邊際時間 / 步 | bytes total（2000 / 16000） | 邊際 bytes / 步 | prover 最大 RSS（2000 / 16000） |
+|---|---|---|---|---|---|---|---|
+| 64 | 原版 Dora | 6.34 / 5.32 / 5.16 → **5.32 s** | 7.14 / 6.08 / 5.41 → **6.08 s** | 54.5 µs | 19,666,928 / 80,034,928 | 4,312.0 | 497 / 543 MB |
+| 64 | Interstellar | 5.36 / 5.13 / 6.04 → **5.36 s** | 7.03 / 6.44 / 6.16 → **6.44 s** | 77.4 µs | 16,156,144 / 51,884,144 | 2,552.0 | 495 / 545 MB |
+| 512 | 原版 Dora | 6.11 / 5.38 / 5.29 → **5.38 s** | 17.44 / 15.30 / 18.71 → **17.44 s** | 861.3 µs | 33,803,536 / 198,139,264 | 11,738.3 | 512 / 701 MB |
+| 512 | Interstellar | 5.50 / 6.78 / 5.50 → **5.50 s** | 15.14 / 11.25 / 12.12 → **12.12 s** | 472.9 µs | 23,640,528 / 113,816,392 | 6,441.1 | 520 / 621 MB |
+| 4096 | 原版 Dora | 7.62 / 5.94 / 5.38 → **5.94 s** | 36.81 / 34.31 / 29.93 → **34.31 s** | 2,025.9 µs | 78,011,664 / 561,386,848 | 34,526.8 | 524 / 1303 MB |
+| 4096 | Interstellar | 7.71 / 6.75 / 5.95 → **6.75 s** | 26.27 / 26.39 / 23.87 → **26.27 s** | 1,394.2 µs | 45,886,224 / 295,805,816 | 17,851.4 | 528 / 1082 MB |
+
+（時間列順序為第 1 / 2 / 3 輪；RSS 為三次的中位數，MB = 2^20 bytes。）
+
+Interstellar 相對原版：
+
+| 每條 gate 數 | 邊際時間 | 邊際 bytes |
+|---|---|---|
+| 64 | +42%（54.5 → 77.4 µs） | −40.8% |
+| 512 | −45.1% | −45.1% |
+| 4096 | −31.2% | −48.3% |
+
+量測上的事實（供解讀）：
+
+- 64 gate 的邊際 bytes 與上方元素模型完全一致：原版 539 × 8 = 4312、Interstellar 319 × 8 = 2552。
+  512 gate 實測（11,738 / 6,441）高於模型（11,352 / 6,248）；16000 步時總 commit 數（約 22.7M / 12.5M）已超過一批 LPN extend（約一千萬），
+  差額應是多出來的 extend 流量（推測，可用 log 中 extend 次數驗證）。4096 gate 的元素模型尚未印出維度，沒有對照。
+- 64 gate 兩版 16000 步的 commit 總數（約 8.6M / 5.1M）都在一批之內，時間增量只有約 1 s；
+  三次之間的差距（約 0.9–1.7 s）與增量同量級，換算成每步約 ±60–120 µs，所以 64 gate 的邊際時間差異在雜訊範圍內。
+- 第 1 輪通常最慢（12 組中 8 組），可能是機器暖機或頻率調整。
+- 記憶體：2000 步兩版都約 0.5 GB（固定開銷）；16000 步隨 gate 數增加，4096 gate 原版 1.30 GB、Interstellar 1.08 GB。
+
+重跑（產生器修改的只有三個參數列）：
+
+```bash
+sed -e 's/^params_clauses  = .*/params_clauses  = [2**3]/' \
+    -e 's/^params_gates    = .*/params_gates    = [2**6, 2**9, 2**12]/' \
+    -e 's/^params_branches = .*/params_branches = [2000, 16000]/' \
+    diet-mac-and-cheese/gen/disj-hyper-param.py > /tmp/disj-marginal.py
+(cd diet-mac-and-cheese/gen && PYTHONPATH=$PWD python3 /tmp/disj-marginal.py f61 /tmp/circ-marginal)
+git worktree add --detach ../dora-minor-revision origin/minor-revision   # 在其中 cargo build --release --bin dietmc_0p
+# 在要測的那份 worktree 內執行（runcirc.sh 用 git toplevel 找 binary）：
+PWRAP="/usr/bin/time -l" caffeinate -i experiments/runcirc.sh /tmp/circ-marginal/branches_..._16000_clauses_8_gates_4096 inter-g4096-n16000
+```
+
 ## 已知可改進
 
 - 最後驗證：每條指令建 eq 表多約 2^(k+1) 個乘法，最後驗證約為原版的 2 倍，指令數多時明顯。
